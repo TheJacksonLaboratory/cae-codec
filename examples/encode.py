@@ -29,10 +29,13 @@ def _image2array(filename, image_group):
 
 
 def encode(in_filenames, out_filenames, image_groups=None, quality=8,
+           metric="mse",
            use_gpu=False,
            overwrite=False):
     # Create a compressor object to use with all input images.
-    compressor = caecodec.ConvolutionalAutoencoder(gpu=use_gpu)
+    compressor = caecodec.ConvolutionalAutoencoder(quality=quality,
+                                                   metric=metric,
+                                                   gpu=use_gpu)
 
     if not isinstance(in_filenames, (list, tuple)):
         in_filenames = [in_filenames]
@@ -95,6 +98,10 @@ if __name__ == "__main__":
     parser.add_argument("-q", "--quality", dest="quality", type=int, 
                         help="Quality of the compression, from 1 to 8",
                         default=8)
+    parser.add_argument("-m", "--metric", dest="metric", type=str, 
+                        help="Metric used to train the model",
+                        choices=["mse", "ms-ssim"],
+                        default="mse")
     parser.add_argument("-g", "--gpu", dest="use_gpu", action="store_true", 
                         help="Use GPU to accelerate compression process (when "
                              "available)",
@@ -139,5 +146,6 @@ if __name__ == "__main__":
 
     encode(args.input, args.output, image_groups=args.image_groups,
            quality=args.quality,
+           metric=args.metric,
            use_gpu=args.use_gpu,
            overwrite=args.overwrite)
