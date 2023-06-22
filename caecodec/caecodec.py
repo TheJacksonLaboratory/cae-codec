@@ -150,7 +150,6 @@ class ConvolutionalAutoencoderBottleneck(Codec):
 
     def decode(self, buf, out=None):
         if out is not None:
-            print("-" *20 + "\nout buffer", len(out))
             out = ensure_contiguous_ndarray(out)
 
         h, w = struct.unpack('>QQ', buf[:16])
@@ -162,9 +161,6 @@ class ConvolutionalAutoencoderBottleneck(Codec):
 
         buf_y_q = buf_y_q[0].detach().cpu().permute(1, 2, 0)
         buf_y_q = buf_y_q.float().numpy()
-        print("-------------------------------------------------------------")
-        print(buf_y_q.shape, out.shape)
-        print("-------------------------------------------------------------")
 
         buf_y_q = np.ascontiguousarray(buf_y_q)
         buf_y_q = ensure_contiguous_ndarray(buf_y_q)
