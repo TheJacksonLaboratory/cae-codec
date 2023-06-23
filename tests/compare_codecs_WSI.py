@@ -305,7 +305,7 @@ if __name__ == "__main__":
 
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    logger_fn = os.path.join(args.log_dir,
+    logger_fn = os.path.join(args.output_dir,
                              'test_codecs%s.log' % args.log_identifier)
     fh = logging.FileHandler(logger_fn, mode='w')
     fh.setFormatter(formatter)
