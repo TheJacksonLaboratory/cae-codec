@@ -275,7 +275,7 @@ if __name__ == "__main__":
                         help="Output directory where to store the results of "
                              "the experiment",
                         default="./")
-    parser.add_argument("-id", "--identifier", dest="log_identifier", type=str,
+    parser.add_argument("-li", "--identifier", dest="log_identifier", type=str,
                         help="Identifier added to the output filename "
                              "`metrics.csv`",
                         default="")
