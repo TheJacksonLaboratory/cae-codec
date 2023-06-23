@@ -4,8 +4,12 @@ import itertools
 
 import os
 import shutil
+import logging
 
 import dask
+import dask.array as da
+from dask.diagnostics import ProgressBar
+from dask.callbacks import Callback
 import numpy as np
 import torch
 import zarr
@@ -58,9 +62,9 @@ def compress_image(codec, quality, input_filename, output_filename,
                    progress_bar=False,
                    gpu=False):
     if progress_bar:
-        progress_callback = dask.diagnostics.ProgressBar
+        progress_callback = ProgressBar
     else:
-        progress_callback = dask.callbacks.Callback
+        progress_callback = Callback
 
     if "CAE" in codec:
         compressor = caecodec.ConvolutionalAutoencoder(quality=quality,
@@ -77,7 +81,7 @@ def compress_image(codec, quality, input_filename, output_filename,
     else:
         raise ValueError("Codec %s not supported" % codec)
 
-    z = dask.array.from_zarr(input_filename, component=data_group)
+    z = da.from_zarr(input_filename, component=data_group)
     z = z[0, :, 0].transpose(1, 2, 0)
     z = z.rechunk(chunks=(patch_size, patch_size, 3))
 
@@ -123,17 +127,17 @@ def compute_metrics(x, lab_x, x_r, progress_bar=False):
         mse = ((x - x_r) ** 2).mean().compute()
 
     psnr = 10 * np.log10((255 ** 2) / mse)
-    rmse = mse.sqrt()
+    rmse = np.sqrt(mse)
 
     # Compute structural similarity measure index
-    ssim_blocks = dask.array.blockwise(ssim_block_fun, 'ij',
+    ssim_blocks = da.blockwise(ssim_block_fun, 'ij',
                                        x, 'ijk',
                                        x_r, 'ijk',
                                        dtype=np.float64).mean()
     with progress_callback():
         ssim_mean = ssim_blocks.compute()
 
-    msssim_blocks = dask.array.blockwise(ms_ssim_block_fun, 'ij',
+    msssim_blocks = da.blockwise(ms_ssim_block_fun, 'ij',
                                          x, 'ijk',
                                          x_r, 'ijk',
                                          dtype=np.float32).mean()
@@ -146,7 +150,7 @@ def compute_metrics(x, lab_x, x_r, progress_bar=False):
                              meta=np.empty((), dtype=np.float32))
 
     with progress_callback():
-        delta_cie76 = ((lab_x - lab_x_r) ** 2).sum(axis=-1).sqrt().compute()
+        delta_cie76 = np.sqrt(((lab_x - lab_x_r) ** 2).sum(axis=-1)).compute()
 
     delta_cie76 = delta_cie76.mean()
 
@@ -162,22 +166,14 @@ def compute_metrics(x, lab_x, x_r, progress_bar=False):
     return metrics
 
 
-def test_compression_per_image(in_filename, codec, quality, ref_codec="Blosc",
+def test_compression_per_image(out_fp, in_filename, codec, quality,
+                               ref_codec="Blosc",
                                patch_size=1024,
                                data_group="0/0",
                                output_dir="./",
-                               log_identifier="",
                                progress_bar=False,
                                gpu=True):
-    output_metrics_filename = os.path.join(output_dir,
-                                           "metrics%s.csv" % log_identifier)
-    if os.path.isfile(output_metrics_filename):
-        out_fp = open(output_metrics_filename, "ab")
-    else:
-        out_fp = open(output_metrics_filename, "w")
-        out_fp.write("codec,quality,ref_codec,patch_size,in_filename")
-        for k in available_metrics:
-            out_fp.write(f",{k}")
+    logger = logging.getLogger('codecs_tests_log')
 
     basename = os.path.basename(in_filename).split(".zarr")[0]
 
@@ -195,7 +191,7 @@ def test_compression_per_image(in_filename, codec, quality, ref_codec="Blosc",
                    gpu=gpu)
     comp_time = perf_counter() - comp_time
 
-    x = dask.array.from_zarr(ref_output_fn, component=data_group)
+    x = da.from_zarr(ref_output_fn, component=data_group)
     lab_x = x.map_blocks(rgb2CIELab, dtype=np.float32,
                          meta=np.empty((), dtype=np.float32))
 
@@ -203,30 +199,35 @@ def test_compression_per_image(in_filename, codec, quality, ref_codec="Blosc",
     z_cmp = zarr.open(temp_output_fn, mode="r")["0/0"]
     rate = 8 * float(z_cmp.nbytes_stored) / (x.shape[0] * x.shape[1])
 
-    x_r = dask.array.from_zarr(temp_output_fn, component="0/0")
+    x_r = da.from_zarr(temp_output_fn, component="0/0")
 
     metrics = compute_metrics(x, lab_x, x_r, progress_bar)
     metrics["comp_time"] = comp_time
     metrics["rate"] = rate
 
+    # Log and write the metric values to the output files
+    out_fp.write(f"{codec},{quality},{ref_codec},{patch_size},{in_filename}")
+    metrics_str = ""
+    for k in available_metrics:
+        metrics_str += f",{metrics[k]}"
+
+    out_fp.write(metrics_str + "\n")
+    logger.info(metrics_str)
+    
+    # Remove the compressed image generated with the current codec to free
+    # space on disk.
     if (temp_output_fn != ref_output_fn
       and os.path.isdir(temp_output_fn)
       and temp_output_fn.endswith(".zarr")):
         shutil.rmtree(temp_output_fn)
 
-    out_fp.write(f"{codec},{quality},{ref_codec},{patch_size},{in_filename}")
-    for k in available_metrics:
-        out_fp.write(f",{metrics[k]}")
-    out_fp.write("\n")
 
-    out_fp.close()
-
-
-def test_codecs(in_filename, patch_size=1024, data_group="0/0",
+def test_codecs(out_fp, in_filename, patch_size=1024, data_group="0/0",
                 output_dir="./",
-                log_identifier="",
                 progress_bar=False,
                 gpu=True):
+    logger = logging.getLogger('codecs_tests_log')
+
     # Test all these configurations
     codecs_qualities = {
         "Blosc": [9],
@@ -241,17 +242,21 @@ def test_codecs(in_filename, patch_size=1024, data_group="0/0",
 
     for codec in codecs_qualities.keys():
         for q in codecs_qualities[codec]:
-            test_compression_per_image(in_filename, codec=codec, quality=q,
-                                        ref_codec="Blosc",
-                                        patch_size=patch_size,
-                                        data_group=data_group,
-                                        output_dir=output_dir,
-                                        log_identifier=log_identifier,
-                                        progress_bar=progress_bar,
-                                        gpu=gpu and codec == "CAE")
+            logger.info(f"Compressing image {in_filename} with codec {codec} "
+                        f"at {q} compression quality")
+            test_compression_per_image(out_fp, in_filename, codec=codec,
+                                       quality=q,
+                                       ref_codec="Blosc",
+                                       patch_size=patch_size,
+                                       data_group=data_group,
+                                       output_dir=output_dir,
+                                       progress_bar=progress_bar,
+                                       gpu=gpu and codec == "CAE")
 
+    # Remove the reference compressed image to free space on disk.
     if os.path.isdir(ref_output_fn) and ref_output_fn.endswith(".zarr"):
         shutil.rmtree(ref_output_fn)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test different codecs in a dataset of "
@@ -263,6 +268,9 @@ if __name__ == "__main__":
     parser.add_argument("-if", "--input-format", dest="input_format", type=str,
                         help="Format of the input images used for testing",
                         default=".zarr")
+    parser.add_argument("-dg", "--data-group", dest="data_group", type=str,
+                        help="Group in the zarr file where the images are stored",
+                        default="")
     parser.add_argument("-o", "--output", dest="output_dir", type=str,
                         help="Output directory where to store the results of "
                              "the experiment",
@@ -279,6 +287,10 @@ if __name__ == "__main__":
                         help="Whether to show progress bars when processing "
                              "the zarr files, or not.",
                         default=False)
+    parser.add_argument("-pl", "--print-log", dest="print_log",
+                        action="store_true",
+                        help="Whether to print log messages on console or not",
+                        default=False)
     parser.add_argument("-g", "--gpu", dest="gpu", action="store_true",
                         help="Whether to use GPU to accelerate CAE codec "
                              "compression (when available).",
@@ -288,10 +300,41 @@ if __name__ == "__main__":
 
     in_filenames = parse_filenames_list(args.input, args.input_format)
 
+    logger = logging.getLogger('codecs_tests_log')
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    logger_fn = os.path.join(args.log_dir,
+                             'test_codecs%s.log' % args.log_identifier)
+    fh = logging.FileHandler(logger_fn, mode='w')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    logger.setLevel(logging.DEBUG)
+
+    if args.print_log:
+        console = logging.StreamHandler()
+        console.setFormatter(formatter)
+        logger.addHandler(console)
+
+    # Log and write the metric values to the output files
+    output_metrics_filename = os.path.join(
+        args.output_dir,
+        "metrics_codec_tests%s.csv" % args.log_identifier)
+
+    out_fp = open(output_metrics_filename, "w")
+    out_fp.write("codec,quality,ref_codec,patch_size,in_filename")
+    for k in available_metrics:
+        out_fp.write(f",{k}")
+    out_fp.write("\n")
+
     for in_fn in in_filenames:
-        test_codecs(in_fn, patch_size=args.patch_size,
+        test_codecs(out_fp, in_fn, patch_size=args.patch_size,
                     data_group=args.data_group,
                     output_dir=args.output_dir,
-                    log_identifier=args.log_identifier,
                     progress_bar=args.progress_bar,
                     gpu=args.gpu)
+
+    out_fp.close()
+    logging.shutdown()
