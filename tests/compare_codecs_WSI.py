@@ -252,6 +252,7 @@ def test_codecs(out_fp, in_filename, patch_size=1024, data_group="0/0",
                                        output_dir=output_dir,
                                        progress_bar=progress_bar,
                                        gpu=gpu and codec == "CAE")
+            out_fp.flush()
 
     # Remove the reference compressed image to free space on disk.
     if os.path.isdir(ref_output_fn) and ref_output_fn.endswith(".zarr"):
@@ -323,6 +324,7 @@ if __name__ == "__main__":
         args.output_dir,
         "metrics_codec_tests%s.csv" % args.log_identifier)
 
+    logger.info("Saving metric in %s" % output_metrics_filename)
     out_fp = open(output_metrics_filename, "w")
     out_fp.write("codec,quality,ref_codec,patch_size,in_filename")
     for k in available_metrics:
