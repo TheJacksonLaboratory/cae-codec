@@ -1,6 +1,9 @@
 import io
 import base64
 import struct
+import itertools
+import functools
+import operator
 
 import numpy as np
 import torch
@@ -13,55 +16,149 @@ from numcodecs.compat import ndarray_copy, ensure_contiguous_ndarray
 
 class ConvolutionalAutoencoder(Codec):
     codec_id = 'cae'
-    def __init__(self, quality=8, metric="mse", gpu=False):
+    def __init__(self, quality=8, metric="mse",
+                 patch_size=256,
+                 gpu=True,
+                 partial_decompress=False,
+                 bottleneck_channels=None,
+                 downsampling_factor=None):
+
+        # The size of the patches depend on the available GPU memory.
+        self.patch_size = 256
+
+        # Whether to reconstruct the image, or just retrieve the bottleneck
+        # tensors.
+        self.partial_decompress = partial_decompress
+
+        # Use GPUs when available and reuqested by the user.
         self.gpu = gpu and torch.cuda.is_available()
         self.quality = quality
         self.metric = metric
 
-        self._net = cai.zoo.bmshj2018_factorized(quality=quality,
-                                                 metric=metric,
+        self._net = cai.zoo.bmshj2018_factorized(quality=self.quality,
+                                                 metric=self.metric,
                                                  pretrained=True)
+        self.bottleneck_channels = self._net.g_a[6].weight.size(0)
+        self.downsampling_factor = self._net.downsampling_factor
+    
+        self._net.eval()
+        self._net.g_a = torch.nn.DataParallel(self._net.g_a)
+        self._net.g_s = torch.nn.DataParallel(self._net.g_s)
+        self._net.entropy_bottleneck = torch.nn.DataParallel(
+            self._net.entropy_bottleneck)
+
         if self.gpu:
             self._net.cuda()
 
-        self._net.eval()
-
     def encode(self, buf):
         h, w, c = buf.shape
+        pad_h = (self.patch_size - h) % self.patch_size
+        pad_w = (self.patch_size - w) % self.patch_size
 
-        buf_x = torch.from_numpy(buf)
-
-        if self.gpu:
-            buf_x = buf_x.cuda()
-
+        buf_x = np.pad(buf, [(0, pad_h), (0, pad_w), (0, 0)])
         with torch.no_grad():
-            buf_x = buf_x.permute(2, 0, 1)
-            buf_x = buf_x.view(1, c, h, w)
-            buf_x = buf_x.float() / 255.0
-            out = self._net.compress(buf_x)
+            buf_x = torch.from_numpy(buf_x)
+            buf_x = buf_x.permute(2, 0, 1).float().div(255.0)
+            buf_x_ps = torch.nn.functional.unfold(
+                buf_x[None, ...],
+                kernel_size=(self.patch_size, self.patch_size),
+                stride=(self.patch_size, self.patch_size), 
+                padding=0)
+            buf_x_ps = buf_x_ps.transpose(1, 2)
+            buf_x_ps = buf_x_ps.reshape(-1, c, self.patch_size,
+                                        self.patch_size)
+            buf_dl = torch.utils.data.DataLoader(
+                buf_x_ps,
+                batch_size=max(1, torch.cuda.device_count()),
+                pin_memory=False,
+                num_workers=0)
 
-        chunk_size_code = struct.pack('>QQ', h, w)
+            out_str = []
+            for buf_x_ps_k in buf_dl:
+                buf_y = self._net.g_a(buf_x_ps_k)
+                out_str += self._net.entropy_bottleneck.module.compress(buf_y)
 
-        return chunk_size_code + out["strings"][0][0]
+        chunk_size_code = struct.pack('>QQQ', h, w, self.patch_size)
+        chunk_size_code += struct.pack('>' + 'Q' * len(out_str),
+                                       *list(map(len, out_str)))
+        chunk_buf = chunk_size_code + functools.reduce(operator.add, out_str)
+        return chunk_buf
 
     def decode(self, buf, out=None):
         if out is not None:
             out = ensure_contiguous_ndarray(out)
 
-        downsampling_factor = self._net.downsampling_factor
+        h, w, patch_size = struct.unpack('>QQQ', buf[:24])
+        nh = int(np.ceil(h / patch_size))
+        nw = int(np.ceil(w / patch_size))
+        n_patches = nh * nw
 
-        h, w = struct.unpack('>QQ', buf[:16])
+        comp_patch_size = patch_size // self.downsampling_factor
+        buf_shape = torch.Size([comp_patch_size, comp_patch_size])
 
-        buf_shape = torch.Size([h // downsampling_factor,
-                                w // downsampling_factor])
+        buf_offset = 24 + 8 * n_patches
+        len_strs = list(struct.unpack('>' + 'Q' * n_patches,
+                                      buf[24:buf_offset]))
+        start_strs = np.cumsum([buf_offset] + len_strs[:-1])
+        strs = [buf[s:s+l] for s, l in zip(start_strs, len_strs)]
 
         with torch.no_grad():
-            dec_out = self._net.decompress(strings=[[buf[16:]]],
-                                           shape=buf_shape)
+            strs_dl = torch.utils.data.DataLoader(
+                strs,
+                batch_size=max(1, torch.cuda.device_count()),
+                pin_memory=False,
+                num_workers=0)
 
-            buf_x_r = dec_out["x_hat"][0].cpu().detach()
-            buf_x_r = buf_x_r * 255.0
-            buf_x_r = buf_x_r.clip(0, 255).to(torch.uint8)
+            if self.partial_decompress:
+                h_comp = h // self.downsampling_factor
+                w_comp = w // self.downsampling_factor
+                y_hat_ps = []
+                for buf_k in strs_dl:
+                    y_hat_ps_k =\
+                        self._net.entropy_bottleneck.module.decompress(
+                            buf_k,
+                            size=buf_shape)
+
+                    y_hat_ps.append(y_hat_ps_k.cpu())
+
+                y_hat_ps = torch.cat(y_hat_ps, dim=0)
+                y_hat_ps = y_hat_ps.reshape(n_patches, -1)
+                y_hat_ps = y_hat_ps.transpose(0, 1)
+
+                y_hat = torch.nn.functional.fold(
+                    y_hat_ps,
+                    output_size=(nh * comp_patch_size, nw * comp_patch_size),
+                    kernel_size=(comp_patch_size, comp_patch_size),
+                    stride=(comp_patch_size, comp_patch_size),
+                    padding=0)
+
+                y_hat = y_hat[..., :h_comp, :w_comp]
+                buf_x_r = y_hat
+
+            else:
+                x_hat_ps = []
+                for buf_k in strs_dl:
+                    y_hat_ps_k =\
+                         self._net.entropy_bottleneck.module.decompress(
+                            buf_k,
+                            size=buf_shape)
+
+                    x_hat_ps.append(self._net.g_s(y_hat_ps_k).cpu())
+
+                x_hat_ps = torch.cat(x_hat_ps, dim=0)
+                x_hat_ps = x_hat_ps.reshape(n_patches, -1)
+                x_hat_ps = x_hat_ps.transpose(0, 1)
+
+                x_hat = torch.nn.functional.fold(
+                    x_hat_ps,
+                    output_size=(nh * patch_size, nw * patch_size),
+                    kernel_size=(patch_size, patch_size),
+                    stride=(patch_size, patch_size),
+                    padding=0)
+
+                x_hat = x_hat[..., :h, :w]
+                buf_x_r = x_hat.mul(255.0).clip(0, 255).to(torch.uint8)
+
             buf_x_r = buf_x_r.permute(1, 2, 0)
             buf_x_r = buf_x_r.numpy()
 
@@ -69,100 +166,3 @@ class ConvolutionalAutoencoder(Codec):
         buf_x_r = ensure_contiguous_ndarray(buf_x_r)
 
         return ndarray_copy(buf_x_r, out)
-
-
-class ConvolutionalAutoencoderBottleneck(Codec):
-    codec_id = 'cae_bn'
-    def __init__(self, channels_bn, quality=8, metric="mse", filters=None,
-                 fact_ent_checkpoint=None,
-                 gpu=False):
-        self.gpu = gpu and torch.cuda.is_available()
-        self.quality = quality
-        self.metric = metric
-
-        # Because only parameters that can be stored as json are supported by
-        # numcodecs, the parameters of the entropy bottleneck model are
-        # converted to bytes and stored as strings to be compatible with json.
-        if fact_ent_checkpoint is None:
-            self.net = cai.zoo.bmshj2018_factorized(quality=quality,
-                                                    metric=metric,
-                                                    pretrained=True)
-
-            filters = self.net.entropy_bottleneck.filters
-
-            fact_ent_checkpoint = {}
-            for n, par in self.net.entropy_bottleneck.named_parameters():
-                fact_ent_checkpoint[n] = self._tensor2bytes(par)
-
-        self.filters = filters
-        self.channels_bn = channels_bn
-        self.fact_ent_checkpoint = fact_ent_checkpoint
-
-        self._setup_encoder(gpu)
-
-    def _setup_encoder(self, gpu=False):
-        # Only the factorized entropy model is needed to convert bytes into the
-        # autoencoder's bottleneck.
-        self._fact_ent = cai.entropy_models.EntropyBottleneck(
-            channels=self.channels_bn,
-            filters=self.filters)
-
-        fact_ent_checkpoint = {}
-        for n, par in self.fact_ent_checkpoint.items():
-            fact_ent_checkpoint[n] = self._bytes2tensor(par)
-
-        self._fact_ent.load_state_dict(fact_ent_checkpoint, strict=False)
-
-        if gpu:
-            self._fact_ent.cuda()
-
-    @staticmethod
-    def _tensor2bytes(tensor):
-        buf = io.BytesIO()
-        torch.save(tensor.cpu().detach(), buf)
-
-        # Convert the bytes buffer into a serializable ASCII string
-        buf = base64.b64encode(buf.getvalue()).decode('ascii')
-        return buf
-
-    @staticmethod
-    def _bytes2tensor(buf):
-        # Decode the string into bytes
-        buf = io.BytesIO(base64.b64decode(buf))
-        tensor = torch.load(buf)
-        return tensor
-
-    def encode(self, buf):
-        h, w, c = buf.shape
-
-        buf_y = torch.from_numpy(buf)
-        buf_y = buf_y.permute(2, 0, 1)
-        buf_y = buf_y.view(1, c, h, w)
-
-        if self.gpu:
-            buf_y = buf_y.cuda()
-
-        buf_ae = self._fact_ent.compress(buf_y)
-
-        chunk_size_code = struct.pack('>QQ', h, w)
-
-        return chunk_size_code + buf_ae[0]
-
-    def decode(self, buf, out=None):
-        if out is not None:
-            out = ensure_contiguous_ndarray(out)
-
-        h, w = struct.unpack('>QQ', buf[:16])
-
-        buf_shape = (h, w)
-
-        buf_y_q = self._fact_ent.decompress([buf[16:]],
-                                            size=buf_shape)
-
-        buf_y_q = buf_y_q[0].detach().cpu().permute(1, 2, 0)
-        buf_y_q = buf_y_q.float().numpy()
-
-        buf_y_q = np.ascontiguousarray(buf_y_q)
-        buf_y_q = ensure_contiguous_ndarray(buf_y_q)
-
-        return ndarray_copy(buf_y_q, out)

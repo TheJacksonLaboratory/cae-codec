@@ -3,6 +3,7 @@ import argparse
 
 import PIL
 import zarr
+import numpy as np
 
 import numcodecs
 import caecodec
@@ -10,15 +11,17 @@ import caecodec
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
 
 
-def _array2image(arr, filename):
-    # Open the input file. This allows any RGB image stored in a format
-    # supported by PIL.
+def _bn2image(bn, filename):
+    # Save the standard deviation in the channels axis of the bottleneck as a 
+    # .png image.
+    arr = bn.std(-1)
+    arr = arr / arr.max() * 255.0
+    arr = arr.astype(np.uint8)
     im = PIL.Image.fromarray(arr)
     im.save(filename, quality_opts={'compress_level': 9, 'optimize': False})
 
 
-def decode(in_filenames, out_filenames, image_groups=None, overwrite=False):
-
+def decode_bn(in_filenames, out_filenames, image_groups=None, overwrite=False):
     if not isinstance(in_filenames, (list, tuple)):
         in_filenames = [in_filenames]
 
@@ -42,16 +45,12 @@ def decode(in_filenames, out_filenames, image_groups=None, overwrite=False):
                              " overwrite it, run this again using the "
                              "-ow/--overwrite option")
 
-        # Save the compressed representation of the image as Zarr format.
-        if len(grp):
-            z_in = zarr.open(in_fn, mode="r")[grp]
-        else:
-            z_in = zarr.open(in_fn)
+        # Modify the .zarr file to enable using the CAE bottleneck tensors
+        # instead of reconstructing the image.
 
-        arr = z_in[:]
-
-        # Convert the pixel array to an image
-        _array2image(arr, out_fn)
+        store = caecodec.BottleneckStore(os.path.join(in_fn, grp), mode="r")
+        z_in = zarr.open(store=store)
+        _bn2image(z_in[:], out_fn)
 
 
 if __name__ == "__main__":
@@ -64,9 +63,6 @@ if __name__ == "__main__":
                         help="Output filenames or a single directory where to "
                              "store the decompressed images.",
                         default=["./"])
-    parser.add_argument("-f", "--format", dest="format", type=str,
-                        help="Output image format",
-                        default="png")
     parser.add_argument("-ig", "--image-group", dest="image_groups", type=str,
                         nargs="+",
                         help="For Zarr files, specify the group where the "
@@ -80,6 +76,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    args.format = ".png"
     if not args.format.startswith("."):
         args.format = "." + args.format
 
@@ -113,5 +110,5 @@ if __name__ == "__main__":
     assert all(map(lambda fn: fn.endswith(".zarr"), args.input)), \
         "All inputs must have .zarr extension"
 
-    decode(args.input, args.output, image_groups=args.image_groups,
-           overwrite=args.overwrite)
+    decode_bn(args.input, args.output, image_groups=args.image_groups,
+              overwrite=args.overwrite)

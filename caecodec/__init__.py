@@ -1,5 +1,5 @@
-from .caecodec import (ConvolutionalAutoencoder,
-                       ConvolutionalAutoencoderBottleneck)
+from .caecodec import ConvolutionalAutoencoder
+from .storages import BottleneckStore
 
 __all__ = ["ConvolutionalAutoencoder",
-           "ConvolutionalAutoencoderBottleneck"]
+           "BottleneckStore"]

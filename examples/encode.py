@@ -5,37 +5,67 @@ import PIL
 import numpy as np
 import torch
 import zarr
+import dask
+import dask.array as da
+from dask.diagnostics import ProgressBar
+from dask.callbacks import Callback
 
 import numcodecs
-import caecodec
 
+available_codecs = ["None", "Blosc"]
+try:
+    from imagecodecs.numcodecs import Jpeg2k, Jpeg
+    numcodecs.register_codec(Jpeg2k)
+    numcodecs.register_codec(Jpeg)
+    available_codecs.append("Jpeg2k")
+    available_codecs.append("Jpeg")
+
+except ModuleNotFoundError:
+    # Jpeg and Jpeg2k will not be available
+    pass
+
+import caecodec
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
+available_codecs.append("CAE")
 
 
 def _image2array(filename, image_group):
-    # If the input is stored in Zarr forma, open the specified `image_group`.
+    # If the input is stored in Zarr format, open the specified `image_group`.
     extension = os.path.basename(filename).split(".")[-1]
     if "zarr" in extension:
-        arr = zarr.open(filename, mode="r")
-        if len(image_group):
-            arr = arr[image_group]
+        # For now, the axes of the zarr image must be in the order TCZYX.
+        arr = da.from_zarr(filename, component=image_group)
+        if arr.ndim > 3:
+            arr = arr[0, :, 0].transpose(1, 2, 0)
     else:
         # Open the input file. This allows any RGB image stored in a format
         # supported by PIL.
         im = PIL.Image.open(filename)
-        arr = np.array(im)
+        arr = da.from_array(np.array(im))
 
     return arr
 
 
-def encode(in_filenames, out_filenames, image_groups=None, quality=8,
+def encode(in_filenames, out_filenames, image_groups=None, codec="CAE",
+           quality=8,
            metric="mse",
+           chunk_size=-1,
            use_gpu=False,
-           overwrite=False):
+           overwrite=False,
+           progress_bar=False):
     # Create a compressor object to use with all input images.
-    compressor = caecodec.ConvolutionalAutoencoder(quality=quality,
-                                                   metric=metric,
-                                                   gpu=use_gpu)
+    if codec == "CAE":
+        compressor = caecodec.ConvolutionalAutoencoder(quality=quality,
+                                                       metric=metric,
+                                                       gpu=use_gpu)
+    elif codec == "Jpeg":
+        compressor = Jpeg(level=quality)
+    elif codec == "Jpeg2k":
+        compressor = Jpeg2k(level=quality)
+    elif codec == "Blosc":
+        compressor = zarr.Blosc(clevel=quality)
+    else:
+        raise ValueError("Codec %s is not implemented" % codec)
 
     if not isinstance(in_filenames, (list, tuple)):
         in_filenames = [in_filenames]
@@ -54,9 +84,15 @@ def encode(in_filenames, out_filenames, image_groups=None, quality=8,
     assert len(in_filenames) == len(image_groups), \
             "The same number of image groups and inputs was expected"
 
+    if progress_bar:
+        progress_callback = ProgressBar
+    else:
+        progress_callback = Callback
+    
     for in_fn, grp, out_fn in zip(in_filenames, image_groups, out_filenames):
         # Convert the image to a pixel array
         x = _image2array(in_fn, grp)
+        x = da.rechunk(x, chunks=(chunk_size, chunk_size, 3))
 
         if not overwrite and os.path.isdir(out_fn):
             raise ValueError("The file %s already exists, if you would like to"
@@ -64,18 +100,10 @@ def encode(in_filenames, out_filenames, image_groups=None, quality=8,
                              "-ow/--overwrite option")
 
         # Save the compressed representation of the image as Zarr format.
-        if len(grp):
-            z_out = zarr.open(out_fn, mode="w")
-            z_out.create_dataset(name=grp, data=x, compressor=compressor,
-                                 chunks=True,
-                                 overwrite=overwrite)
-        else:
-            store = zarr.DirectoryStore(out_fn)
-            z_out = zarr.create(store=store, shape=x.shape, dtype=x.dtype,
-                                compressor=compressor,
-                                chunks=True,
-                                overwrite=overwrite)
-            z_out[:] = x
+        with progress_callback():
+            x.to_zarr(out_fn, component=grp if len(grp) else None,
+                      compressor=compressor,
+                      overwrite=overwrite)
 
 
 if __name__ == "__main__":
@@ -95,13 +123,25 @@ if __name__ == "__main__":
                         help="For Zarr files, specify the group where the "
                              "images are stored",
                         default=[""])
+    parser.add_argument("-c", "--codec", dest="codec", type=str, 
+                        help="Codec method to compress the images",
+                        choices=available_codecs,
+                        default="CAE")
     parser.add_argument("-q", "--quality", dest="quality", type=int, 
-                        help="Quality of the compression, from 1 to 8",
                         default=8)
     parser.add_argument("-m", "--metric", dest="metric", type=str, 
-                        help="Metric used to train the model",
+                        help="Metric used when the mnodel was trained (only CAE"
+                             " codec)",
                         choices=["mse", "ms-ssim"],
                         default="mse")
+    parser.add_argument("-cs", "--chunk-size", dest="chunk_size", type=int, 
+                        help="Size of the chunks used to store the image data",
+                        default=1024)
+    parser.add_argument("-pb", "--progress-bar", dest="progress_bar",
+                        action="store_true", 
+                        help="Display progress bar as the image is being "
+                             "compressed",
+                        default=False)
     parser.add_argument("-g", "--gpu", dest="use_gpu", action="store_true", 
                         help="Use GPU to accelerate compression process (when "
                              "available)",
@@ -145,7 +185,10 @@ if __name__ == "__main__":
         "All outputs must have .zarr extension"
 
     encode(args.input, args.output, image_groups=args.image_groups,
+           codec=args.codec,
            quality=args.quality,
            metric=args.metric,
+           chunk_size=args.chunk_size,
            use_gpu=args.use_gpu,
+           progress_bar=args.progress_bar,
            overwrite=args.overwrite)
