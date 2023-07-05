@@ -17,6 +17,7 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     install_requires=[
         'numcodecs>=0.10.2',
+        'imagecodecs>=2023.7.4',
         'compressai>=1.2.4',
     ],
     python_requires='>=3.7'

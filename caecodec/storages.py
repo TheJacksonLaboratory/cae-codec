@@ -16,7 +16,7 @@ class BottleneckStore(zarr.storage.FSStore):
         if mode != "r":
             raise ValueError("Bottleneck tensors are read-only, please use "
                              "`mode=r` instead")
-        super(BottleneckStore, self).__init__(url, w="r+", **kwargs)
+        super(BottleneckStore, self).__init__(url, mode="r+", **kwargs)
 
         self._meta = zarr.util.json_loads(self[".zarray"])
 
