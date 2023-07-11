@@ -16,8 +16,8 @@ setuptools.setup(
     url="https://github.com/TheJacksonLaboratory/caecodec",
     packages=setuptools.find_packages(),
     install_requires=[
-        'numcodecs>=0.10.2',
-        'imagecodecs>=2023.7.4',
+        'numcodecs>=0.11.0',
+        'imagecodecs>=2021.8.26',
         'compressai>=1.2.4',
     ],
     python_requires='>=3.7'

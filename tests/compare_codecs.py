@@ -1,23 +1,29 @@
 import argparse
+import functools
+import itertools
+
 import os
 import shutil
 import logging
 
+import PIL
 import dask
 import dask.array as da
 from dask.diagnostics import ProgressBar
 from dask.callbacks import Callback
-import PIL
 import numpy as np
 import torch
 import zarr
 
 from imagecodecs.numcodecs import Jpeg2k, Jpeg
 import numcodecs
+import sys
+sys.path.insert(0, "/mnt/cai")
 import caecodec
 
 numcodecs.register_codec(Jpeg2k)
 numcodecs.register_codec(Jpeg)
+caecodec.ConvolutionalAutoencoder._patch_size = 1024
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
 
 from time import perf_counter
@@ -32,7 +38,6 @@ available_metrics = ["height", "width", "channels", "rate", "rmse", "msssim",
                      "comp_time",
                      "decomp_time"]
 available_codecs = ["CAE", "Jpeg", "Jpeg2k", "Blosc", "None"]
-
 
 def _image2array(filename, image_group):
     # If the input is stored in Zarr format, open the specified `image_group`.
@@ -62,8 +67,7 @@ def encode(in_filenames, out_filenames, image_groups=None, codec="CAE",
     if codec == "CAE":
         compressor = caecodec.ConvolutionalAutoencoder(quality=quality,
                                                        metric=metric,
-                                                       gpu=use_gpu,
-                                                       patch_size=2048)
+                                                       gpu=use_gpu)
     elif codec == "Jpeg":
         compressor = Jpeg(level=quality)
     elif codec == "Jpeg2k":
@@ -123,10 +127,17 @@ def ssim_block_fun(x, x_r):
 
 
 def ms_ssim_block_fun(x, x_r):
+    c, h, w = x.shape
+    x_pad = np.copy(x)
+    x_r_pad = np.copy(x_r)
+    x_pad = np.moveaxis(x_pad, -1, 0)[np.newaxis]
+    x_r_pad = np.moveaxis(x_r_pad, -1, 0)[np.newaxis]
+
     ms_ssim_bkl = ms_ssim(
-        torch.from_numpy(np.moveaxis(x_r, -1, 0)[np.newaxis]).float(),
-        torch.from_numpy(np.moveaxis(x, -1, 0)[np.newaxis]).float(),
+        torch.from_numpy(x_r_pad).float(),
+        torch.from_numpy(x_pad).float(),
         data_range=255)
+
     return np.array([[ms_ssim_bkl]], dtype=np.float64)
 
 
@@ -207,7 +218,11 @@ def test_compression(out_fp, in_filename, codec, quality,
                      gpu=True):
     logger = logging.getLogger('codecs_tests_log')
 
-    basename = os.path.basename(in_filename).split(".zarr")[0]
+    if not len(image_group):
+        image_group = None
+    
+    source_format = os.path.basename(in_filename).split(".")[-1]
+    basename = os.path.basename(in_filename).split(source_format)[0]
     temp_output_fn = os.path.join(output_dir,
                                   basename + "_%s.zarr" % codec)
 
@@ -223,16 +238,18 @@ def test_compression(out_fp, in_filename, codec, quality,
            progress_bar=progress_bar)
     comp_time = perf_counter() - comp_time
 
-    x = da.from_zarr(in_filename, component=image_group)
+    x = _image2array(in_filename, image_group)
     x = da.rechunk(x, (chunk_size, chunk_size, 3))
     lab_x = x.map_blocks(rgb2CIELab, dtype=np.float32,
                          meta=np.empty((), dtype=np.float32))
 
     # Compute compression rate
-    z_cmp = zarr.open(temp_output_fn, mode="r")["0/0"]
+    z_cmp = zarr.open(temp_output_fn, mode="r")
+    if image_group:
+        z_cmp = z_cmp[image_group]
     rate = 8 * float(z_cmp.nbytes_stored) / (x.shape[0] * x.shape[1])
 
-    x_r = da.from_zarr(temp_output_fn, component="0/0")
+    x_r = da.from_zarr(temp_output_fn, component=image_group)
     x_r = da.rechunk(x_r, (chunk_size, chunk_size, 3))
     metrics = compute_metrics(x, lab_x, x_r, progress_bar)
 
@@ -267,8 +284,7 @@ if __name__ == "__main__":
                         help="Input image file",
                         required=True)
     parser.add_argument("-ig", "--image-group", dest="image_group", type=str,
-                        help="Group in the zarr file where the images are"
-                             " stored",
+                        help="Group in the zarr file where the images are stored",
                         default="")
     parser.add_argument("-o", "--output", dest="output_dir", type=str,
                         help="Output directory where to store the results of "
@@ -290,8 +306,8 @@ if __name__ == "__main__":
                         default=1024)
     parser.add_argument("-pb", "--progress-bar", dest="progress_bar",
                         action="store_true",
-                        help="Whether to show progress bars when processing "
-                             "the zarr files, or not.",
+                        help="Whether to show progress bars when compressing and"
+                             " comparing the codec or not.",
                         default=False)
     parser.add_argument("-pl", "--print-log", dest="print_log",
                         action="store_true",
@@ -310,9 +326,7 @@ if __name__ == "__main__":
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
     logger_fn = os.path.join(args.output_dir,
-                             'test_codecs_%s_%i%s.log' % (args.codec,
-                                                          args.quality,
-                                                          args.log_identifier))
+                             'test_codecs_%s_%i%s.log' % (args.codec, args.quality, args.log_identifier))
     fh = logging.FileHandler(logger_fn, mode='w')
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -326,9 +340,7 @@ if __name__ == "__main__":
     # Log and write the metric values to the output files
     output_metrics_filename = os.path.join(
         args.output_dir,
-        "metrics_%s_%i%s.csv" % (args.codec,
-                                 args.quality,
-                                 args.log_identifier))
+        "metrics_%s_%i%s.csv" % (args.codec, args.quality, args.log_identifier))
 
     out_fp = open(output_metrics_filename, "w")
     logger.info(f"Saving metric in {output_metrics_filename} {out_fp}")
@@ -338,8 +350,9 @@ if __name__ == "__main__":
     out_fp.write("\n")
 
     basename = os.path.basename(args.input).split(".")[0]
-    logger.info(f"Compressing image {args.input} with codec {args.codec} at "
-                f"{args.quality} compression quality")
+    
+    logger.info(f"Compressing image {args.input} with codec {args.codec} "
+                f"at {args.quality} compression quality")
     test_compression(out_fp, args.input, codec=args.codec,
                      quality=args.quality,
                      chunk_size=args.chunk_size,
