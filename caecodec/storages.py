@@ -60,7 +60,7 @@ class BottleneckStore(zarr.storage.FSStore):
         self._output_meta["dtype"] = "|f4"
 
     def __getitem__(self, key):
-        if key == ".zarray":
+        if ".zarray" in key:
             return self._output_meta
         else:
             return self[key]
