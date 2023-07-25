@@ -80,15 +80,15 @@ def encode(in_filenames, out_filenames, image_groups=None, codec="CAE",
         image_groups = [image_groups] * len(in_filenames)
 
     assert len(in_filenames) == len(out_filenames), \
-            "The same number of inputs and outputs was expected"
+        "The same number of inputs and outputs was expected"
     assert len(in_filenames) == len(image_groups), \
-            "The same number of image groups and inputs was expected"
+        "The same number of image groups and inputs was expected"
 
     if progress_bar:
         progress_callback = ProgressBar
     else:
         progress_callback = Callback
-    
+
     for in_fn, grp, out_fn in zip(in_filenames, image_groups, out_filenames):
         # Convert the image to a pixel array
         x = _image2array(in_fn, grp)
