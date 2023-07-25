@@ -15,7 +15,7 @@ class BottleneckStore(zarr.storage.FSStore):
     -----
     Used for read-only operations.
     """
-    def __init__(self, url, mo="r", **kwargs):
+    def __init__(self, url, mode="r", **kwargs):
         if mode != "r":
             raise ValueError("Bottleneck tensors are read-only, please use "
                              "`mode=r` instead")
