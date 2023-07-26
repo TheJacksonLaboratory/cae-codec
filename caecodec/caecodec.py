@@ -1,7 +1,4 @@
-import io
-import base64
 import struct
-import itertools
 import functools
 import operator
 
@@ -40,13 +37,8 @@ class ConvolutionalAutoencoder(Codec):
                                                  pretrained=True)
         self.bottleneck_channels = self._net.g_a[6].weight.size(0)
         self.downsampling_factor = self._net.downsampling_factor
-    
-        self._net.eval()
-        self._net.g_a = torch.nn.DataParallel(self._net.g_a)
-        self._net.g_s = torch.nn.DataParallel(self._net.g_s)
-        self._net.entropy_bottleneck = torch.nn.DataParallel(
-            self._net.entropy_bottleneck)
 
+        self._net.eval()
         if self.gpu:
             self._net.cuda()
 
@@ -58,6 +50,8 @@ class ConvolutionalAutoencoder(Codec):
         buf_x = np.pad(buf, [(0, pad_h), (0, pad_w), (0, 0)])
         with torch.no_grad():
             buf_x = torch.from_numpy(buf_x)
+            if self.gpu:
+                buf_x = buf_x.cuda()
             buf_x = buf_x.permute(2, 0, 1).float().div(255.0)
             buf_x_ps = torch.nn.functional.unfold(
                 buf_x[None, ...],
@@ -75,8 +69,7 @@ class ConvolutionalAutoencoder(Codec):
 
             out_str = []
             for buf_x_ps_k in buf_dl:
-                buf_y = self._net.g_a(buf_x_ps_k)
-                out_str += self._net.entropy_bottleneck.module.compress(buf_y)
+                out_str += self._net.compress(buf_x_ps_k)["strings"][0]
 
         chunk_size_code = struct.pack('>QQQ', h, w, self.patch_size)
         chunk_size_code += struct.pack('>' + 'Q' * len(out_str),
@@ -103,11 +96,7 @@ class ConvolutionalAutoencoder(Codec):
         strs = [buf[s:s+l] for s, l in zip(start_strs, len_strs)]
 
         with torch.no_grad():
-            strs_dl = torch.utils.data.DataLoader(
-                strs,
-                batch_size=max(1, torch.cuda.device_count()),
-                pin_memory=False,
-                num_workers=0)
+            strs_dl = strs
 
             if self.partial_decompress:
                 h_comp = h // self.downsampling_factor
@@ -115,10 +104,9 @@ class ConvolutionalAutoencoder(Codec):
                 y_hat_ps = []
                 for buf_k in strs_dl:
                     y_hat_ps_k =\
-                        self._net.entropy_bottleneck.module.decompress(
-                            buf_k,
+                        self._net.entropy_bottleneck.decompress(
+                            [buf_k],
                             size=buf_shape)
-
                     y_hat_ps.append(y_hat_ps_k.cpu())
 
                 y_hat_ps = torch.cat(y_hat_ps, dim=0)
@@ -138,12 +126,9 @@ class ConvolutionalAutoencoder(Codec):
             else:
                 x_hat_ps = []
                 for buf_k in strs_dl:
-                    y_hat_ps_k =\
-                         self._net.entropy_bottleneck.module.decompress(
-                            buf_k,
-                            size=buf_shape)
-
-                    x_hat_ps.append(self._net.g_s(y_hat_ps_k).cpu())
+                    x_hat_ps_k = self._net.decompress([[buf_k]],
+                                                      shape=buf_shape)
+                    x_hat_ps.append(x_hat_ps_k["x_hat"].cpu())
 
                 x_hat_ps = torch.cat(x_hat_ps, dim=0)
                 x_hat_ps = x_hat_ps.reshape(n_patches, -1)
