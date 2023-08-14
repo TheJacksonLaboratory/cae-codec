@@ -1,6 +1,4 @@
 import argparse
-import functools
-import itertools
 
 import os
 import shutil
@@ -17,18 +15,20 @@ import zarr
 
 from imagecodecs.numcodecs import Jpeg2k, Jpeg
 import numcodecs
-import sys
 import caecodec
+
+from time import perf_counter
+from skimage.color import rgb2lab
+from skimage.metrics import structural_similarity
+from pytorch_msssim import ms_ssim
+
+from skimage import morphology, color, filters, transform
 
 numcodecs.register_codec(Jpeg2k)
 numcodecs.register_codec(Jpeg)
 caecodec.ConvolutionalAutoencoder._patch_size = 1024
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
 
-from time import perf_counter
-from skimage.color import rgb2lab
-from skimage.metrics import structural_similarity
-from pytorch_msssim import ms_ssim
 
 available_metrics = ["height", "width", "channels", "rate", "rmse", "msssim",
                      "ssim",
@@ -37,6 +37,7 @@ available_metrics = ["height", "width", "channels", "rate", "rmse", "msssim",
                      "comp_time",
                      "decomp_time"]
 available_codecs = ["CAE", "Jpeg", "Jpeg2k", "Blosc", "None"]
+
 
 def _image2array(filename, image_group):
     # If the input is stored in Zarr format, open the specified `image_group`.
@@ -53,6 +54,29 @@ def _image2array(filename, image_group):
         arr = da.from_array(np.array(im))
 
     return arr
+
+
+def compute_mask(chunk, mask_scale=1.0, min_size=16, area_threshold=128,
+                 thresh=None):
+    gray = color.rgb2gray(chunk)
+    scaled_gray = transform.rescale(gray, scale=mask_scale, order=0,
+                                    preserve_range=True)
+
+    if thresh is None:
+        thresh = filters.threshold_otsu(scaled_gray)
+
+    chunk_mask = scaled_gray > thresh
+    chunk_mask = morphology.remove_small_objects(
+        chunk_mask == 0, min_size=min_size ** 2, connectivity=2)
+    chunk_mask = morphology.remove_small_holes(
+        chunk_mask, area_threshold=area_threshold ** 2)
+    chunk_mask = morphology.binary_dilation(
+        chunk_mask, morphology.disk(min_size))
+
+    if chunk_mask.sum() > 0:
+        return chunk
+    else:
+        return np.zeros_like(chunk)
 
 
 def encode(in_filenames, out_filenames, image_groups=None, codec="CAE",
@@ -89,9 +113,9 @@ def encode(in_filenames, out_filenames, image_groups=None, codec="CAE",
         image_groups = [image_groups] * len(in_filenames)
 
     assert len(in_filenames) == len(out_filenames), \
-            "The same number of inputs and outputs was expected"
+        "The same number of inputs and outputs was expected"
     assert len(in_filenames) == len(image_groups), \
-            "The same number of image groups and inputs was expected"
+        "The same number of image groups and inputs was expected"
 
     if progress_bar:
         progress_callback = ProgressBar
@@ -102,6 +126,9 @@ def encode(in_filenames, out_filenames, image_groups=None, codec="CAE",
         # Convert the image to a pixel array
         x = _image2array(in_fn, grp)
         x = da.rechunk(x, chunks=(chunk_size, chunk_size, 3))
+        x = x.map_blocks(x,
+                         dtype=np.uint8,
+                         meta=np.empty((0, 0, 0), dtype=np.uint8))
 
         if not overwrite and os.path.isdir(out_fn):
             raise ValueError("The file %s already exists, if you would like to"
@@ -219,7 +246,7 @@ def test_compression(out_fp, in_filename, codec, quality,
 
     if not len(image_group):
         image_group = None
-    
+
     source_format = os.path.basename(in_filename).split(".")[-1]
     basename = os.path.basename(in_filename).split(source_format)[0]
     temp_output_fn = os.path.join(output_dir,
@@ -267,12 +294,12 @@ def test_compression(out_fp, in_filename, codec, quality,
 
     out_fp.write(metrics_str + "\n")
     logger.info(metrics_str)
-    
+
     # Remove the compressed image generated with the current codec to free
     # space on disk.
     if (temp_output_fn != in_filename
-      and os.path.isdir(temp_output_fn)
-      and temp_output_fn.endswith(".zarr")):
+       and os.path.isdir(temp_output_fn)
+       and temp_output_fn.endswith(".zarr")):
         shutil.rmtree(temp_output_fn)
 
 
@@ -283,34 +310,37 @@ if __name__ == "__main__":
                         help="Input image file",
                         required=True)
     parser.add_argument("-ig", "--image-group", dest="image_group", type=str,
-                        help="Group in the zarr file where the images are stored",
+                        help="Group in the zarr file where the images are "
+                             "stored.",
                         default="")
     parser.add_argument("-o", "--output", dest="output_dir", type=str,
                         help="Output directory where to store the results of "
-                             "the experiment",
+                             "the experiment.",
                         default="./")
     parser.add_argument("-c", "--codec", dest="codec", type=str,
                         help="Testing codec",
                         choices=available_codecs,
                         default=available_codecs[0])
     parser.add_argument("-q", "--quality", dest="quality", type=int,
-                        help="Codec compression quality",
+                        help="Codec compression quality.",
                         default=8)
     parser.add_argument("-li", "--identifier", dest="log_identifier", type=str,
                         help="Identifier added to the output filename "
-                             "`metrics.csv`",
+                             "`metrics.csv`.",
                         default="")
-    parser.add_argument("-cs", "--chunk-size", dest="chunk_size", type=int, 
-                        help="Size of the chunks used to store the image data",
+    parser.add_argument("-cs", "--chunk-size", dest="chunk_size", type=int,
+                        help="Size of the chunks used to store the image "
+                             "data.",
                         default=1024)
     parser.add_argument("-pb", "--progress-bar", dest="progress_bar",
                         action="store_true",
-                        help="Whether to show progress bars when compressing and"
-                             " comparing the codec or not.",
+                        help="Whether to show progress bars when compressing "
+                             "and comparing the codec or not.",
                         default=False)
     parser.add_argument("-pl", "--print-log", dest="print_log",
                         action="store_true",
-                        help="Whether to print log messages on console or not",
+                        help="Whether to print log messages on console or "
+                             "not.",
                         default=False)
     parser.add_argument("-g", "--gpu", dest="gpu", action="store_true",
                         help="Whether to use GPU to accelerate CAE codec "
@@ -325,7 +355,9 @@ if __name__ == "__main__":
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
     logger_fn = os.path.join(args.output_dir,
-                             'test_codecs_%s_%i%s.log' % (args.codec, args.quality, args.log_identifier))
+                             'test_codecs_%s_%i%s.log' % (args.codec,
+                                                          args.quality,
+                                                          args.log_identifier))
     fh = logging.FileHandler(logger_fn, mode='w')
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -339,7 +371,8 @@ if __name__ == "__main__":
     # Log and write the metric values to the output files
     output_metrics_filename = os.path.join(
         args.output_dir,
-        "metrics_%s_%i%s.csv" % (args.codec, args.quality, args.log_identifier))
+        "metrics_%s_%i%s.csv" % (args.codec, args.quality,
+                                 args.log_identifier))
 
     out_fp = open(output_metrics_filename, "w")
     logger.info(f"Saving metric in {output_metrics_filename} {out_fp}")
@@ -349,7 +382,7 @@ if __name__ == "__main__":
     out_fp.write("\n")
 
     basename = os.path.basename(args.input).split(".")[0]
-    
+
     logger.info(f"Compressing image {args.input} with codec {args.codec} "
                 f"at {args.quality} compression quality")
     test_compression(out_fp, args.input, codec=args.codec,

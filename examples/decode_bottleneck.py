@@ -3,6 +3,12 @@ import argparse
 
 import PIL
 import zarr
+import dask
+import dask.array as da
+
+from dask.diagnostics import ProgressBar
+from dask.callbacks import Callback
+
 import numpy as np
 
 import numcodecs
@@ -21,7 +27,10 @@ def _bn2image(bn, filename):
     im.save(filename, quality_opts={'compress_level': 9, 'optimize': False})
 
 
-def decode_bn(in_filenames, out_filenames, image_groups=None, overwrite=False):
+def decode_bn(in_filenames, out_filenames, image_groups=None,
+              progress_bar=False,
+              overwrite=False):
+
     if not isinstance(in_filenames, (list, tuple)):
         in_filenames = [in_filenames]
 
@@ -39,6 +48,11 @@ def decode_bn(in_filenames, out_filenames, image_groups=None, overwrite=False):
     assert len(in_filenames) == len(image_groups), \
             "The same number of image groups and inputs was expected"
 
+    if progress_bar:
+        progress_callback = ProgressBar
+    else:
+        progress_callback = Callback
+
     for in_fn, grp, out_fn in zip(in_filenames, image_groups, out_filenames):
         if not overwrite and os.path.isfile(out_fn):
             raise ValueError("The file %s already exists, if you would like to"
@@ -49,8 +63,11 @@ def decode_bn(in_filenames, out_filenames, image_groups=None, overwrite=False):
         # instead of reconstructing the image.
 
         store = caecodec.BottleneckStore(os.path.join(in_fn, grp), mode="r")
-        z_in = zarr.open(store=store)
-        _bn2image(z_in[:], out_fn)
+        z_in = da.from_zarr(store)
+        with progress_callback():
+            bn_arr = z_in[:].compute()
+
+        _bn2image(bn_arr, out_fn)
 
 
 if __name__ == "__main__":
@@ -72,6 +89,11 @@ if __name__ == "__main__":
                         action="store_true", 
                         help="Overwrite existing files with the same output "
                              "name",
+                        default=False)
+    parser.add_argument("-pb", "--progress-bar", dest="progress_bar",
+                        action="store_true",
+                        help="Display progress bar as the image is being "
+                             "compressed",
                         default=False)
 
     args = parser.parse_args()
@@ -111,4 +133,5 @@ if __name__ == "__main__":
         "All inputs must have .zarr extension"
 
     decode_bn(args.input, args.output, image_groups=args.image_groups,
+              progress_bar=args.progress_bar,
               overwrite=args.overwrite)

@@ -102,6 +102,7 @@ class ConvolutionalAutoencoder(Codec):
                 h_comp = h // self.downsampling_factor
                 w_comp = w // self.downsampling_factor
                 y_hat_ps = []
+
                 for buf_k in strs_dl:
                     y_hat_ps_k =\
                         self._net.entropy_bottleneck.decompress(
@@ -125,10 +126,12 @@ class ConvolutionalAutoencoder(Codec):
 
             else:
                 x_hat_ps = []
+
                 for buf_k in strs_dl:
                     x_hat_ps_k = self._net.decompress([[buf_k]],
                                                       shape=buf_shape)
                     x_hat_ps.append(x_hat_ps_k["x_hat"].cpu())
+
 
                 x_hat_ps = torch.cat(x_hat_ps, dim=0)
                 x_hat_ps = x_hat_ps.reshape(n_patches, -1)
