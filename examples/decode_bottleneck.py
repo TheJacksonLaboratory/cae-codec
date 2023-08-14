@@ -47,13 +47,9 @@ def decode_bn(in_filenames, out_filenames, image_groups=None,
                              " overwrite it, run this again using the "
                              "-ow/--overwrite option")
 
-        # Modify the .zarr file to enable using the CAE bottleneck tensors
-        # instead of reconstructing the image.
-        if isinstance(grp, str) and len(grp):
-            in_fn = in_fn + "/" + grp
-
+        # Use the CAE bottleneck tensors instead of reconstructing the image.
         store = caecodec.BottleneckStore(in_fn, mode="r")
-        z_in = da.from_zarr(store)
+        z_in = da.from_zarr(store, component=grp)
         with progress_callback():
             bn_arr = z_in[:].compute()
 
