@@ -1,8 +1,6 @@
 import os
 import argparse
 
-import PIL
-import zarr
 import dask
 import dask.array as da
 
@@ -15,16 +13,6 @@ import numcodecs
 import caecodec
 
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
-
-
-def _bn2image(bn, filename):
-    # Save the standard deviation in the channels axis of the bottleneck as a 
-    # .png image.
-    arr = bn.std(-1)
-    arr = arr / arr.max() * 255.0
-    arr = arr.astype(np.uint8)
-    im = PIL.Image.fromarray(arr)
-    im.save(filename, quality_opts={'compress_level': 9, 'optimize': False})
 
 
 def decode_bn(in_filenames, out_filenames, image_groups=None,
@@ -61,13 +49,16 @@ def decode_bn(in_filenames, out_filenames, image_groups=None,
 
         # Modify the .zarr file to enable using the CAE bottleneck tensors
         # instead of reconstructing the image.
+        if isinstance(grp, str) and len(grp):
+            in_fn = in_fn + "/" + grp
 
-        store = caecodec.BottleneckStore(os.path.join(in_fn, grp), mode="r")
+        store = caecodec.BottleneckStore(in_fn, mode="r")
         z_in = da.from_zarr(store)
         with progress_callback():
             bn_arr = z_in[:].compute()
 
-        _bn2image(bn_arr, out_fn)
+        # Save the bottleneck as a numpy array
+        np.save(out_fn, bn_arr)
 
 
 if __name__ == "__main__":

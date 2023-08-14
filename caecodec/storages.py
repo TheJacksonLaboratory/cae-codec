@@ -6,10 +6,7 @@ import requests
 
 class BottleneckStore(zarr.storage.FSStore):
     """Store class that allows to extract the bottleneck tensor from zarr
-    arrays compresse wth the ConvolutionalAutoencoder codec.
-
-    Examples
-    --------
+    arrays compressed with the ConvolutionalAutoencoder codec.
 
     Notes
     -----
@@ -21,7 +18,7 @@ class BottleneckStore(zarr.storage.FSStore):
                              "`mode=r` instead")
         super(BottleneckStore, self).__init__(url, mode="r+", **kwargs)
 
-        url_z_array = os.path.join(url, '.zarray')
+        url_z_array = url + '/.zarray'
         try:
             metadata_resp = requests.get(url_z_array)
 
