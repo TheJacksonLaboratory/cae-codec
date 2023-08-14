@@ -48,7 +48,8 @@ class BottleneckStore(zarr.storage.FSStore):
             else:
                 raise ValueError(f"Could not find {url_z_array}")
 
-        except requests.exceptions.MissingSchema:
+        except (requests.exceptions.MissingSchema,
+                requests.exceptions.InvalidSchema):
             if os.path.exists(url_z_array):
                 with open(url_z_array, mode="r") as fp:
                     meta = json.load(fp)
