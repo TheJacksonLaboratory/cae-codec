@@ -81,11 +81,13 @@ if __name__ == "__main__":
 
     batch = []
     for fn in args.input:
+        # Use the BottleneckStore storage to open the compressed image and use
+        # it as a bottleneck tensor for other deep learning model inference.
         store = caecodec.BottleneckStore(fn, mode="r")
         z_arr = zarr.open(store)
 
-        # Take a random crop of size 256x256 uncompressed pixels, or 16x16
-        # compressed pixels.
+        # Take a random crop of size 256x256 uncompressed pixels, equivalent to
+        # a 16x16 patch in compressed pixels.
         h, w, _ = z_arr.shape
 
         r_y = random.randint(0, h - 17)
@@ -93,6 +95,9 @@ if __name__ == "__main__":
 
         crop_range = (slice(r_y, r_y + 16, None), slice(r_x, r_x + 16, None),
                       slice(None))
+
+        # Reorder the tensor axes to have channels, height, and width (cyx)
+        # structure.
         z_arr = torch.from_numpy(z_arr[crop_range].transpose(2, 0, 1))
 
         batch.append(z_arr)
@@ -122,4 +127,5 @@ if __name__ == "__main__":
 
     output = net(batch)
 
-    print("Output", output.shape)
+    print("Output:", output.shape)
+    print("Inferred class:", output.max(dim=1))

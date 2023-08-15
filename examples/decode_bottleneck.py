@@ -85,7 +85,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    args.format = ".png"
+    args.format = ".npy"
     if not args.format.startswith("."):
         args.format = "." + args.format
 

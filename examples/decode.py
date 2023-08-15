@@ -12,6 +12,7 @@ from dask.callbacks import Callback
 import numcodecs
 import caecodec
 
+caecodec.ConvolutionalAutoencoder.patch_size = 128
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
 
 

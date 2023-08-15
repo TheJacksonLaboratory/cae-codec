@@ -52,12 +52,12 @@ class ConvolutionalAutoencoder(Codec):
     codec_id = 'cae'
     bottleneck_channels = None
     downsampling_factor = None
-    _patch_size = 256
-    _partial_decompress = False
-    _gpu = False
+    patch_size = None
+    partial_decompress = False
+    gpu = False
 
     def __init__(self, quality: int = 8, metric: str = "mse",
-                 patch_size: int = None,
+                 patch_size: int = 256,
                  partial_decompress: bool = False,
                  gpu: bool = True,
                  **kwargs) -> None:
@@ -80,14 +80,16 @@ class ConvolutionalAutoencoder(Codec):
             Whether GPU processing is enabled or not. When no GPUs are present
             this is automatically set to False.
         """
-        # The size of the patches depend on the available GPU memory.
-        if patch_size is not None:
-            self._patch_size = patch_size
+        # The size of the patches depend on the available GPU memory and must
+        # be mdified in the header of the file, preferably before registering
+        # with `numcodecs.register_codec`.
+        if self.patch_size is None:
+            self.patch_size = patch_size
 
-        self._partial_decompress = partial_decompress
+        self.partial_decompress = partial_decompress
 
         # Use GPUs when available and reuqested by the user.
-        self._gpu = gpu and torch.cuda.is_available()
+        self.gpu = gpu and torch.cuda.is_available()
 
         self.quality = quality
         self.metric = metric
@@ -104,36 +106,6 @@ class ConvolutionalAutoencoder(Codec):
             self._net.g_a.cuda()
             self._net.g_s.cuda()
 
-    @property
-    def patch_size(self) -> int:
-        """The size of the patches in which the input image is divided to fit
-        in the GPU's memory.
-        """
-        return self._patch_size
-
-    @patch_size.setter
-    def patch_size(self, patch_size: int) -> None:
-        self._patch_size = patch_size
-
-    @property
-    def partial_decompress(self) -> bool:
-        """Whether to reconstruct the image or just retrieve the bottleneck 
-        tensors.
-        """
-        return self._partial_decompress
-
-    @partial_decompress.setter
-    def partial_decompress(self, partial_decompress: bool = False) -> None:
-        self._partial_decompress = partial_decompress
-
-    @property
-    def gpu(self) -> bool:
-        return self._gpu
-
-    @gpu.setter
-    def gpu(self, gpu: bool) -> None:
-        self._gpu = gpu
-
     def encode(self, buf: np.ndarray) -> bytes:
         """Encode image-like buffer `buf` into a set of bytes.
 
@@ -148,15 +120,21 @@ class ConvolutionalAutoencoder(Codec):
             Encoded image/chunk.
         """
         h, w, c = buf.shape
-        pad_h = (self._patch_size - h) % self._patch_size
-        pad_w = (self._patch_size - w) % self._patch_size
+        pad_h = (self.patch_size - h) % self.patch_size
+        pad_w = (self.patch_size - w) % self.patch_size
 
-        comp_patch_size = self._patch_size // self.downsampling_factor
-        nh = (h + pad_h) // self._patch_size
-        nw = (w + pad_w) // self._patch_size
+        comp_patch_size = self.patch_size // self.downsampling_factor
+        nh = (h + pad_h) // self.patch_size
+        nw = (w + pad_w) // self.patch_size
         n_patches = nh * nw
 
-        buf_x = np.pad(buf, [(0, pad_h), (0, pad_w), (0, 0)])
+        offset_in = self.downsampling_factor
+        offset_out = 1
+
+        buf_x = np.pad(buf, [(offset_in, pad_h + offset_in),
+                             (offset_in, pad_w + offset_in),
+                             (0, 0)],
+                       mode='reflect')
         with torch.no_grad():
             buf_x = torch.from_numpy(buf_x)
 
@@ -165,25 +143,34 @@ class ConvolutionalAutoencoder(Codec):
             buf_x = buf_x.permute(2, 0, 1).float().div(255.0)
             buf_x_ps = torch.nn.functional.unfold(
                 buf_x[None, ...],
-                kernel_size=(self._patch_size, self._patch_size),
-                stride=(self._patch_size, self._patch_size), 
+                kernel_size=(self.patch_size + 2 * offset_in,
+                             self.patch_size + 2 * offset_in),
+                stride=(self.patch_size, self.patch_size), 
                 padding=0)
+
             buf_x_ps = buf_x_ps.transpose(1, 2)
-            buf_x_ps = buf_x_ps.reshape(-1, c, self._patch_size,
-                                        self._patch_size)
+
+            buf_x_ps = buf_x_ps.reshape(-1, c,
+                                        self.patch_size + 2 * offset_in,
+                                        self.patch_size + 2 * offset_in)
+
             buf_dl = torch.utils.data.DataLoader(
                 buf_x_ps,
                 batch_size=max(1, torch.cuda.device_count()),
-                pin_memory=self._gpu,
+                pin_memory=self.gpu,
                 num_workers=0)
 
             # Compress each patch with the autoencoder model. 
             buf_y_ps = []
             for buf_x_ps_k in buf_dl:
-                if self._gpu:
+                if self.gpu:
                     buf_x_ps_k = buf_x_ps_k.cuda()
-                buf_y_ps_k = self._net.g_a(buf_x_ps_k)
-                buf_y_ps.append(buf_y_ps_k.detach().cpu())
+                buf_y_ps_k = self._net.g_a(buf_x_ps_k).detach().cpu()
+                buf_y_ps.append(
+                    buf_y_ps_k[...,
+                               offset_out:comp_patch_size + offset_out,
+                               offset_out:comp_patch_size + offset_out]
+                               )
 
             buf_y_ps = torch.cat(buf_y_ps, dim=0)
             buf_y_ps = buf_y_ps.reshape(n_patches, -1)
@@ -223,51 +210,72 @@ class ConvolutionalAutoencoder(Codec):
             out = ensure_contiguous_ndarray(out)
 
         h, w, pad_h, pad_w = struct.unpack('>QQQQ', buf[:32])
-        padded_shape = ((h + pad_h) // self.downsampling_factor,
-                        (w + pad_w) // self.downsampling_factor)
-        nh = (h + pad_h) // self._patch_size
-        nw = (w + pad_w) // self._patch_size
-        comp_patch_size = self._patch_size // self.downsampling_factor
+        comp_h = (h + pad_h) // self.downsampling_factor
+        comp_w = (w + pad_w) // self.downsampling_factor
 
         with torch.no_grad():
             buf_y = self._net.entropy_bottleneck.decompress([buf[32:]],
-                                                            padded_shape)
+                                                            (comp_h, comp_w))
 
             # If downstream analysis is performed uisng the compressed
             # bottleneck tensor, just apply the arithmetic decoder to recover
             # the downsampled tensor. Otherwise, apply the synthesis track of
             # the autoencoder model to recover the compressed image.
-            if self._partial_decompress:
-                h_comp = int(math.ceil(h / self.downsampling_factor))
-                w_comp = int(math.ceil(w / self.downsampling_factor))
-                buf_x_r = buf_y[0, :, :h_comp, :w_comp]
+            if self.partial_decompress:
+                dwn_h = int(math.ceil(h / self.downsampling_factor))
+                dwn_w = int(math.ceil(w / self.downsampling_factor))
+                buf_x_r = buf_y[0, :, :dwn_h, :dwn_w]
 
             else:
+                comp_patch_size = self.patch_size // self.downsampling_factor
+
+                comp_pad_h = (comp_patch_size - comp_h) % comp_patch_size
+                comp_pad_w = (comp_patch_size - comp_w) % comp_patch_size
+
+                nh = (comp_h + comp_pad_h) // comp_patch_size
+                nw = (comp_w + comp_pad_w) // comp_patch_size
+
+                offset_in = 1
+                offset_out = self.downsampling_factor
+
+                buf_y = torch.nn.functional.pad(
+                    buf_y,
+                    (offset_in, comp_pad_w + offset_in,
+                     offset_in, comp_pad_h + offset_in,
+                     0, 0),
+                    mode='reflect')
+
                 # Divide the input image into patches of size `patch_size`, so
                 # it can fit in the GPU's memory.
                 buf_y_ps = torch.nn.functional.unfold(
-                    buf_y, kernel_size=(comp_patch_size, comp_patch_size),
-                    stride=(comp_patch_size, comp_patch_size), 
+                    buf_y,
+                    kernel_size=(comp_patch_size + 2 * offset_in,
+                                 comp_patch_size + 2 * offset_in),
+                    stride=(comp_patch_size, comp_patch_size),
                     padding=0)
                 buf_y_ps = buf_y_ps.transpose(1, 2)
                 buf_y_ps = buf_y_ps.reshape(-1, self.bottleneck_channels,
-                                            comp_patch_size,
-                                            comp_patch_size)
+                                            comp_patch_size + 2 * offset_in,
+                                            comp_patch_size + 2 * offset_in)
                 buf_dl = torch.utils.data.DataLoader(
                     buf_y_ps,
                     batch_size=max(1, torch.cuda.device_count()),
-                    pin_memory=self._gpu,
+                    pin_memory=self.gpu,
                     num_workers=0)
 
                 # Compress each patch with the autoencoder model. 
                 buf_x_ps = []
                 for buf_y_ps_k in buf_dl:
-                    if self._gpu:
+                    if self.gpu:
                         buf_y_ps_k = buf_y_ps_k.cuda()
                     buf_x_ps_k = self._net.g_s(buf_y_ps_k).detach().cpu()
-                    buf_x_ps.append(buf_x_ps_k)
+                    buf_x_ps.append(
+                        buf_x_ps_k[...,
+                                   offset_out:self.patch_size+offset_out,
+                                   offset_out:self.patch_size+offset_out]
+                                   )
 
-                n_patches = len(buf_x_ps)
+                n_patches = nh * nw
                 buf_x_ps = torch.cat(buf_x_ps, dim=0)
                 buf_x_ps = buf_x_ps.reshape(n_patches, -1)
                 buf_x_ps = buf_x_ps.transpose(0, 1)
@@ -275,9 +283,9 @@ class ConvolutionalAutoencoder(Codec):
                 # Stitch the patches into a single image.
                 buf_x = torch.nn.functional.fold(
                     buf_x_ps,
-                    output_size=(nh * self._patch_size, nw * self._patch_size),
-                    kernel_size=(self._patch_size, self._patch_size),
-                    stride=(self._patch_size, self._patch_size),
+                    output_size=(nh * self.patch_size, nw * self.patch_size),
+                    kernel_size=(self.patch_size, self.patch_size),
+                    stride=(self.patch_size, self.patch_size),
                     padding=0)
 
                 buf_x = buf_x[..., :h, :w]

@@ -22,7 +22,7 @@ import caecodec
 
 numcodecs.register_codec(Jpeg2k)
 numcodecs.register_codec(Jpeg)
-caecodec.ConvolutionalAutoencoder._patch_size = 1024
+caecodec.ConvolutionalAutoencoder.patch_size = 1024
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
 
 from time import perf_counter
@@ -120,12 +120,12 @@ def rgb2CIELab(x):
     return x_lab
 
 
-def ssim_block_fun(x, x_r):
+def ssim_block(x, x_r):
     ssim_bkl = structural_similarity(x, x_r, channel_axis=2)
     return np.array([[ssim_bkl]], dtype=np.float64)
 
 
-def ms_ssim_block_fun(x, x_r):
+def ms_ssim_block(x, x_r):
     c, h, w = x.shape
     x_pad = np.copy(x)
     x_r_pad = np.copy(x_r)
@@ -165,27 +165,27 @@ def compute_metrics(x, lab_x, x_r, progress_bar=False):
     rmse = np.sqrt(mse)
 
     # Compute structural similarity measure index
-    ssim_blocks = da.map_blocks(ssim_block_fun, x, x_r,
-                                dtype=np.float64,
-                                chunks=(1, 1),
-                                drop_axis=(2,),
-                                meta=np.empty((0,), dtype=np.float64))
-    ssim_blocks = ssim_blocks.mean()
+    ssim_blks = da.map_blocks(ssim_block, x, x_r,
+                              dtype=np.float64,
+                              chunks=(1, 1),
+                              drop_axis=(2,),
+                              meta=np.empty((0,), dtype=np.float64))
+    ssim_blks = ssim_blks.mean()
 
     logger.debug("Computing mean SSIM")
     with progress_callback():
-        ssim_mean = ssim_blocks.compute()
+        ssim_mean = ssim_blks.compute()
 
-    msssim_blocks = da.map_blocks(ms_ssim_block_fun, x, x_r,
-                                  dtype=np.float32,
-                                  chunks=(1, 1),
-                                  drop_axis=(2,),
-                                  meta=np.empty((0,), dtype=np.float32))
-    msssim_blocks = msssim_blocks.mean()
+    ms_ssim_blks = da.map_blocks(ms_ssim_block, x, x_r,
+                                 dtype=np.float32,
+                                 chunks=(1, 1),
+                                 drop_axis=(2,),
+                                 meta=np.empty((0,), dtype=np.float32))
+    ms_ssim_blks = ms_ssim_blks.mean()
 
     logger.debug("Computing mean MS-SSIM")
     with progress_callback():
-        msssim_mean = msssim_blocks.compute()
+        ms_ssim_mean = ms_ssim_blks.compute()
 
     # Compute delta E in the CIE Lab space for color distortion
     lab_x_r = x_r.map_blocks(rgb2CIELab,
@@ -199,7 +199,7 @@ def compute_metrics(x, lab_x, x_r, progress_bar=False):
 
     metrics = dict(
         rmse=rmse,
-        msssim=msssim_mean,
+        msssim=ms_ssim_mean,
         ssim=ssim_mean,
         psnr=psnr,
         delta_cie76=delta_cie76,

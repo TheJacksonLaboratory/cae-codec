@@ -25,6 +25,8 @@ except ModuleNotFoundError:
     pass
 
 import caecodec
+
+caecodec.ConvolutionalAutoencoder.patch_size = 512
 numcodecs.register_codec(caecodec.ConvolutionalAutoencoder)
 available_codecs.append("CAE")
 

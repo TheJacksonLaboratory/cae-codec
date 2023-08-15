@@ -1,18 +1,18 @@
 # CAE-Codec
-Convolutional Autoencoder (CAE) codec for image compression in Zarr format.
+Convolutional Autoencoder (CAE) codec for image compression in [Zarr](https://zarr.readthedocs.io/en/stable/index.html) format.
 
 The CAE extends the Factorized Prior model from Balle, et. al. (2018) ["Variational Image Compression with a Scale Hyperprior"](https://arxiv.org/abs/1802.01436) to be used as chunk compressor to store images in [zarr](https://zarr.readthedocs.io) format.
-The original convolutional autoencoder models come from the [Compress-AI library](https://github.com/InterDigitalInc/CompressAI).
-This package allows also to use the compressed representation of images as a feature map for machine learning downstream analsysis.
+This codec uses the pre-trained convolutional autoencoders from the [Compress-AI library](https://github.com/InterDigitalInc/CompressAI).
+The main contribution of this project is to enable the use of compressed images as bottleneck tensors for deep learning downstream applications.
 
 ## Usage
 ### Compress and decompress
-The `examples/` directory contains the python scripts to convert one or more images to the `zarr` format, and vice versa, using the CAE codec as compressor.
+The `examples/` directory contains some python scripts that illustrate common use cases of this codec.
+These tasks involve encoding and decoding one or more images using the CAE-codec, and a downstream application that involves an adapted Vision Transformer for image classification on compressed images.
 
 ### Use the CAE codec as Zarr compressor
 First register the `ConvolutionalAutoencoder` class as a valid codec with the `numcodecs.register_codec` function.
-Now the CAE codec can be used as compressor to store image-like arrays in zarr format.
-For now, only two-dimensional + three-channel (RGB) images are supported, since the CAE model has only been trained on these kind images.
+For now, only two-dimensional + three-color-channel (RGB) images are supported, since the CAE models have been trained on these kind images.
 ```
 >>> import numcodecs
 >>> import caecodec
@@ -22,7 +22,7 @@ For now, only two-dimensional + three-channel (RGB) images are supported, since 
 >>> cae_compressor = caecodec.ConvolutionalAutoencoder(quality=8, metric="mse", gpu=True)
 ```
 
-Then use the CAE codec as `compressor` when creating the zarr array.
+Once registered, the CAE codec is ready to be used as _compressor_ when creating zarr arrays.
 ```
 >>> import numpy as np
 >>> import zarr
@@ -44,13 +44,16 @@ Storage ratio      : 3.4
 Chunks initialized : 6/6
 ```
 
-There are sixteen configurations for the CAE compressor, involving eight levels of compression quality (`[1, 8]`) and two metrics (`"mse"`, `"ms-ssim"`) for each quality level. These parameters refer to the reconstruction distortion performance metric used when the models were trained.
+The CAE-codec must be registered with the `numcodecs.register_codec` function on any script where images compressed with this codec will be used.
 
+### Compression parameters
+There are sixteen configurations for the CAE compressor, involving eight levels of compression quality (`[1, 8]`) and two metrics (`"mse"`, `"ms-ssim"`) for each quality level. These meetrics refer to the distortion metric used to train the models.
+The configurations can be specified when creating a compressor object from the `ConvolutionAutoencoder` class.
 
-### Use the compressed representation as a feature map for donwstream analysis
-This package implements the `BottleneckStore` based on the `zarr.storage.FSStore` class, which allows to open zarr arrays compressed with the `ConvolutionalAutoencoder` codec to retrieve the compressed representation of the image.
-The main use of this functionality is to carry out downstream analysis on images without the need to decompress the image, since the compressed representation can be considered as a feature map representing the original image.
-To prevent modiying the compressed representation of images, the `BottleneckStore` can only be used in read-only mode.
+### Use the compressed representation as a bottleneck tensor for donwstream analysis
+This package implements the `BottleneckStore` storage class based on the `zarr.storage.FSStore` class, which allows to open zarr arrays compressed with the `ConvolutionalAutoencoder` codec to retrieve the compressed representation of the image as a tensor.
+The main use of this is to enable downstream analysis on images without decompressing the image by using the compressed representation as feature maps generated during the encoding step.
+To prevent modifications to the compressed representation of images and possible corruption of their compressed files, the `BottleneckStore` can only be used in read-only mode.
 
 The following shows an example of how the `BottleneckStore` can be used to open a zarr array and retrieve its compressed representations.
 ```
